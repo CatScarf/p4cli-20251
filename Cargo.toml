@@ -1,0 +1,16 @@
+[package]
+name = "p4cli-20251"
+version = "0.1.0"
+edition = "2024"
+description = "A simple Rust library to interact with Perforce command-line tools."
+readme = "README.md"
+repository = "https://github.com/CatScarf/p4cli-20251"
+license = "MIT"
+
+[dependencies]
+zstd = "0.13.3"
+p4cli-20251-win-x64 = "0.1.0"
+p4cli-20251-mac-arm64 = "0.1.0"
+p4cli-20251-mac-x64 = "0.1.0"
+p4cli-20251-linux-arm64 = "0.1.0"
+p4cli-20251-linux-x64 = "0.1.0"
