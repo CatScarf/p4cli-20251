@@ -77,3 +77,14 @@ fn main() -> std::io::Result<()> {
 ```
 
 Drop the stream mid-way to cancel the process.
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
+## Embedded Perforce Binary
+
+This crate bundles the Perforce (Helix Core) command-line client (`p4`) binary for each supported platform.
+The `p4` binary is proprietary software owned by Perforce Software, Inc.
+Use of the bundled binary is subject to Perforce's
+[Master Terms & Conditions and P4 Supplemental Terms](https://www.perforce.com/legal).
