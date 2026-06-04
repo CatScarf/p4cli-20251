@@ -6,7 +6,7 @@ A simple Rust library for full-featured P4 CLI with zero pre-install, where all 
 
 ```toml
 [dependencies]
-p4cli-20251 = "0.1.0"
+p4cli-20251 = "0.2.0"
 ```
 
 ```rust
