@@ -4,7 +4,7 @@ A simple Rust library for full-featured P4 (Perforce) CLI with zero pre-install,
 
 ```toml
 [dependencies]
-p4cli-20251 = "0.5.2"
+p4cli-20251 = "0.5.3"
 ```
 
 ## Synchronous API
