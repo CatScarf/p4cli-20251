@@ -1,10 +1,22 @@
+pub mod downloader;
+pub mod finder;
+pub mod platform;
+
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::Duration;
 
-/// Per-instance temp dir via `tempfile`, cleaned up on Drop.
+// ---------------------------------------------------------------------------
+// P4Cli
+// ---------------------------------------------------------------------------
+
+/// A handle to a `p4` binary, either from the system or downloaded.
+///
+/// Resolution order:
+/// 1. Check `PATH` and common install directories for a working `p4`.
+/// 2. Download from Perforce's official filehost.
 ///
 /// ```rust
 /// use p4cli_20251::P4Cli;
@@ -18,13 +30,66 @@ use std::time::Duration;
 /// ```
 pub struct P4Cli {
     bin_path: PathBuf,
-    _temp_dir: tempfile::TempDir,
+    /// Held only when p4 was downloaded (auto-cleaned on Drop).
+    _cache: Option<tempfile::TempDir>,
 }
 
+impl P4Cli {
+    /// Locate or download a working `p4` binary.
+    pub fn new() -> std::io::Result<Self> {
+        // 1. Try system.
+        if let Some(path) = finder::find_system_p4() {
+            return Ok(Self {
+                bin_path: path,
+                _cache: None,
+            });
+        }
+        // 2. Download from Perforce.
+        let (bin_path, cache) = downloader::download_p4()?;
+        Ok(Self {
+            bin_path,
+            _cache: Some(cache),
+        })
+    }
+
+    /// Equivalent to `self.command().args(args).run()`.
+    pub fn run<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> std::io::Result<P4Output> {
+        self.command().args(args).run()
+    }
+
+    /// Equivalent to `self.command().args(args).stream()`.
+    pub fn stream<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> std::io::Result<P4Stream> {
+        self.command().args(args).stream()
+    }
+
+    /// Obtain a [`P4Command`] builder.
+    ///
+    /// ```rust
+    /// use p4cli_20251::P4Cli;
+    /// use std::time::Duration;
+    /// fn main() -> std::io::Result<()> {
+    ///     let p4: P4Cli = P4Cli::new()?;
+    ///     let output: p4cli_20251::P4Output = p4
+    ///         .command()
+    ///         .arg("--help")
+    ///         .timeout(Duration::from_secs(10))
+    ///         .run()?;
+    ///     if output.success() {
+    ///         println!("{}", output.stdout_str()?);
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn command(&self) -> P4Command<'_> {
+        P4Command::new(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P4Output
+// ---------------------------------------------------------------------------
+
 /// Raw stdout/stderr bytes, exit code and timeout flag from a p4 invocation.
-///
-/// For large outputs (e.g. `p4 sync`, `p4 fstat`), use [`P4Cli::stream`]
-/// instead of [`P4Cli::run`] to avoid buffering all output in memory.
 pub struct P4Output {
     exit_code: i32,
     timed_out: bool,
@@ -37,12 +102,10 @@ impl P4Output {
         self.exit_code
     }
 
-    /// Returns `true` when the process was killed by a timeout.
     pub fn timed_out(&self) -> bool {
         self.timed_out
     }
 
-    /// Returns `true` when the process exited with code 0 and was not timed out.
     pub fn success(&self) -> bool {
         !self.timed_out && self.exit_code == 0
     }
@@ -97,7 +160,6 @@ impl std::fmt::Debug for P4Output {
 // Streaming API
 // ---------------------------------------------------------------------------
 
-/// A single event yielded by [`P4Stream`].
 pub enum P4StreamEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
@@ -105,7 +167,6 @@ pub enum P4StreamEvent {
 }
 
 impl P4StreamEvent {
-    /// Try to decode this event's payload as UTF-8.
     pub fn as_utf8(&self) -> Option<&str> {
         match self {
             P4StreamEvent::Stdout(data) | P4StreamEvent::Stderr(data) => {
@@ -131,10 +192,7 @@ impl std::fmt::Display for P4StreamEvent {
     }
 }
 
-/// Merged stdout/stderr byte chunks (~64 KB each) as a single iterator.
-///
-/// Uses a bounded channel (64 slots) for backpressure. The final item is
-/// always [`P4StreamEvent::Exit`]. Drop mid-way to kill.
+/// Merged stdout/stderr byte chunks (~64 KB each) via bounded channel (64 slots).
 ///
 /// ```rust
 /// use p4cli_20251::{P4Cli, P4StreamEvent};
@@ -183,7 +241,6 @@ impl Iterator for P4Stream {
             Ok(item) => Some(item),
             Err(_) => {
                 self.exhausted = true;
-                // Wait for the child to be reaped.
                 match self.child.take() {
                     Some(mut c) => match c.wait() {
                         Ok(status) => Some(Ok(P4StreamEvent::Exit(status.code().unwrap_or(-1)))),
@@ -198,10 +255,6 @@ impl Iterator for P4Stream {
 
 impl Drop for P4Stream {
     fn drop(&mut self) {
-        // Drop rx so sender threads break out of send().
-        // The handles field is consumed by join, but dropping JoinHandle
-        // simply detaches the thread — the threads exit on their own once
-        // the child is killed and pipes close.
         if let Some(ref mut child) = self.child {
             let _ = child.kill();
             let _ = child.wait();
@@ -210,126 +263,9 @@ impl Drop for P4Stream {
 }
 
 // ---------------------------------------------------------------------------
-// Binary extraction
-// ---------------------------------------------------------------------------
-
-fn write_p4_cli_to_disk() -> std::io::Result<(PathBuf, tempfile::TempDir)> {
-    let zst_data = get_p4_cli_zst();
-    let binary_data = decompress_zst(&zst_data)?;
-
-    let temp_dir = create_temp_dir()?;
-    let bin_path = temp_dir.path().join("p4_binary");
-    let tmp_path = temp_dir.path().join(".tmp");
-
-    {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(&binary_data)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, &bin_path)?;
-    set_executable_perms(&bin_path)?;
-
-    Ok((bin_path, temp_dir))
-}
-
-fn create_temp_dir() -> std::io::Result<tempfile::TempDir> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("p4cli-20251");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o700));
-    }
-    builder.tempdir()
-}
-
-fn decompress_zst(zst_data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut decoder = zstd::stream::Decoder::new(zst_data)?;
-    let mut buf = Vec::new();
-    std::io::copy(&mut decoder, &mut buf)?;
-    Ok(buf)
-}
-
-#[cfg(unix)]
-fn set_executable_perms(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn set_executable_perms(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
-}
-
-fn get_p4_cli_zst() -> Vec<u8> {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        use p4cli_20251_win_x64::get_p4_cli_zst;
-        get_p4_cli_zst()
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        use p4cli_20251_mac_arm64::get_p4_cli_zst;
-        get_p4_cli_zst()
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        use p4cli_20251_mac_x64::get_p4_cli_zst;
-        get_p4_cli_zst()
-    }
-
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        any(target_env = "gnu", target_env = "musl")
-    ))]
-    {
-        use p4cli_20251_linux_x64::get_p4_cli_zst;
-        get_p4_cli_zst()
-    }
-
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "aarch64",
-        any(target_env = "gnu", target_env = "musl")
-    ))]
-    {
-        use p4cli_20251_linux_arm64::get_p4_cli_zst;
-        get_p4_cli_zst()
-    }
-
-    #[cfg(not(any(
-        all(target_os = "windows", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "x86_64"),
-        all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            any(target_env = "gnu", target_env = "musl")
-        ),
-        all(
-            target_os = "linux",
-            target_arch = "aarch64",
-            any(target_env = "gnu", target_env = "musl")
-        ),
-    )))]
-    {
-        compile_error!(format!(
-            "Unsupported platform: {}-{}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ));
-        Vec::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // P4Command builder
 // ---------------------------------------------------------------------------
 
-/// Builder for a single p4 invocation (timeout, cwd, env, stdin).
 pub struct P4Command<'a> {
     cli: &'a P4Cli,
     args: Vec<std::ffi::OsString>,
@@ -362,10 +298,8 @@ impl<'a> P4Command<'a> {
         self
     }
 
-    /// Maximum wall-clock time. Kills the direct child on timeout (not process tree).
-    ///
-    /// When the process is killed by timeout, [`P4Output::timed_out`] returns `true`.
-    /// Not supported with [`stream()`](Self::stream) — use [`run()`](Self::run) instead.
+    /// Maximum wall-clock time. Kills the direct child on timeout.
+    /// Use [`P4Output::timed_out`] to detect timeout vs normal exit.
     pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
         self.timeout = Some(timeout);
         self
@@ -390,22 +324,16 @@ impl<'a> P4Command<'a> {
         self
     }
 
-    /// Block until the process exits, returning collected output.
-    ///
-    /// For large output, consider [`stream()`](Self::stream) instead to
-    /// avoid buffering everything in memory.
     pub fn run(&mut self) -> std::io::Result<P4Output> {
         let mut cmd = Command::new(&self.cli.bin_path);
         cmd.args(&self.args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
         if self.stdin_data.is_some() {
             cmd.stdin(Stdio::piped());
         } else {
             cmd.stdin(Stdio::null());
         }
-
         if let Some(ref cwd) = self.cwd {
             cmd.current_dir(cwd);
         }
@@ -417,12 +345,9 @@ impl<'a> P4Command<'a> {
 
         let stdin_handle = self.stdin_data.take().and_then(|data| {
             child.stdin.take().map(|mut stdin| {
-                thread::spawn(move || {
-                    if let Err(e) = stdin.write_all(&data) {
-                        Err(e)
-                    } else {
-                        Ok(())
-                    }
+                thread::spawn(move || match stdin.write_all(&data) {
+                    Err(e) => Err(e),
+                    Ok(_) => Ok(()),
                 })
             })
         });
@@ -441,7 +366,6 @@ impl<'a> P4Command<'a> {
             BufReader::new(stdout).read_to_end(&mut buf)?;
             Ok::<_, std::io::Error>(buf)
         });
-
         let stderr_handle = thread::spawn(move || {
             let mut buf = Vec::new();
             BufReader::new(stderr).read_to_end(&mut buf)?;
@@ -450,14 +374,12 @@ impl<'a> P4Command<'a> {
 
         let (exit_status, timed_out) = wait_process(&mut child, self.timeout)?;
 
-        // Surface stdin write errors.
         if let Some(handle) = stdin_handle {
             handle
                 .join()
                 .map_err(|_| std::io::Error::other("stdin thread panicked"))?
                 .map_err(|e| std::io::Error::other(format!("stdin write failed: {e}")))?;
         }
-
         let stdout_buf = stdout_handle
             .join()
             .map_err(|_| std::io::Error::other("stdout reader thread panicked"))?
@@ -476,24 +398,17 @@ impl<'a> P4Command<'a> {
     }
 
     /// Streaming iterator over stdout/stderr byte chunks.
-    ///
-    /// Uses a bounded channel (64 slots) for backpressure. The final event
-    /// is [`P4StreamEvent::Exit`]. Drop mid-way to cancel.
-    ///
-    /// **Note**: [`timeout`](Self::timeout) is not supported — use
-    /// [`run()`](Self::run) instead.
+    /// Uses a bounded channel (64 slots). Timeout is not supported here.
     pub fn stream(&mut self) -> std::io::Result<P4Stream> {
         if self.timeout.is_some() {
             return Err(std::io::Error::other(
                 "timeout is not supported on stream(); use run() instead",
             ));
         }
-
         let mut cmd = Command::new(&self.cli.bin_path);
         cmd.args(&self.args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
         if self.stdin_data.is_some() {
             cmd.stdin(Stdio::piped());
         } else {
@@ -507,7 +422,6 @@ impl<'a> P4Command<'a> {
         }
 
         let mut child = cmd.spawn()?;
-
         if let Some(data) = self.stdin_data.take()
             && let Some(mut stdin) = child.stdin.take()
         {
@@ -525,7 +439,6 @@ impl<'a> P4Command<'a> {
             .take()
             .ok_or_else(|| std::io::Error::other("stderr was not captured"))?;
 
-        // Bounded channel for backpressure (64 slots).
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
 
         let tx_out = tx.clone();
@@ -603,52 +516,5 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> std::io::Result<(E
             return Ok((child.wait()?, true));
         }
         thread::sleep(Duration::from_millis(50));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-impl P4Cli {
-    /// Decompress embedded p4 binary to a `tempfile`-managed temp directory.
-    pub fn new() -> std::io::Result<Self> {
-        let (bin_path, temp_dir) = write_p4_cli_to_disk()?;
-        Ok(Self {
-            bin_path,
-            _temp_dir: temp_dir,
-        })
-    }
-
-    /// Equivalent to `self.command().args(args).run()`.
-    pub fn run<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> std::io::Result<P4Output> {
-        self.command().args(args).run()
-    }
-
-    /// Equivalent to `self.command().args(args).stream()`.
-    pub fn stream<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> std::io::Result<P4Stream> {
-        self.command().args(args).stream()
-    }
-
-    /// Obtain a [`P4Command`] builder.
-    ///
-    /// ```rust
-    /// use p4cli_20251::P4Cli;
-    /// use std::time::Duration;
-    /// fn main() -> std::io::Result<()> {
-    ///     let p4: P4Cli = P4Cli::new()?;
-    ///     let output: p4cli_20251::P4Output = p4
-    ///         .command()
-    ///         .arg("--help")
-    ///         .timeout(Duration::from_secs(10))
-    ///         .run()?;
-    ///     if output.success() {
-    ///         println!("{}", output.stdout_str()?);
-    ///     }
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn command(&self) -> P4Command<'_> {
-        P4Command::new(self)
     }
 }

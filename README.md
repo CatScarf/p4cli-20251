@@ -1,10 +1,12 @@
 # P4CLI-20251
 
-A simple Rust library for full-featured P4 (Perforce) CLI with zero pre-install, already battle-tested and mature in production environments, where all errors are propagated via Result without any unwrap.
+A simple Rust library for full-featured P4 (Perforce) CLI with zero pre-install. All errors are propagated via `Result` without any `unwrap`.
+
+The `p4` binary is **not** bundled. On first use, it locates a system installation or downloads it from Perforce's official filehost.
 
 ```toml
 [dependencies]
-p4cli-20251 = "0.5.8"
+p4cli-20251 = "0.6.0"
 ```
 
 ## Synchronous API
@@ -19,12 +21,12 @@ fn main() -> std::io::Result<()> {
     let output: p4cli_20251::P4Output = p4.run(&["--help"])?;
 
     println!("exit: {}", output.exit_code());
-    println!("{}", output.stdout_str()?);
+    println!("stdout: {}", output.stdout_str()?);
     Ok(())
 }
 ```
 
-With timeout, working directory and environment variables via builder:
+With timeout detection:
 
 ```rust
 use p4cli_20251::P4Cli;
@@ -34,13 +36,16 @@ fn main() -> std::io::Result<()> {
     let p4: P4Cli = P4Cli::new()?;
     let output: p4cli_20251::P4Output = p4
         .command()
-        .arg("info")
-        .env("P4PORT", "ssl:perforce:1666")
-        .timeout(Duration::from_secs(10))
+        .arg("sync")
+        .timeout(Duration::from_secs(30))
         .run()?;
 
-    if output.success() {
+    if output.timed_out() {
+        eprintln!("p4 timed out");
+    } else if output.success() {
         println!("{}", output.stdout_str()?);
+    } else {
+        eprintln!("p4 failed (exit {})", output.exit_code());
     }
     Ok(())
 }
@@ -59,7 +64,6 @@ fn main() -> std::io::Result<()> {
     for event in p4.stream(&["info"])? {
         match event? {
             P4StreamEvent::Stdout(chunk) => {
-                // Decode as UTF-8 (or other encoding)
                 if let Ok(text) = std::str::from_utf8(&chunk) {
                     print!("{text}");
                 }
@@ -78,13 +82,21 @@ fn main() -> std::io::Result<()> {
 
 Drop the stream mid-way to cancel the process.
 
+## Supported Platforms
+
+| Target | Download |
+|--------|----------|
+| Windows x86\_64 | `bin.ntx64/p4.exe` |
+| macOS ARM64 | `bin.mac20arm64/p4` |
+| macOS x86\_64 | `bin.macosx1015x86_64/p4` |
+| Linux x86\_64 (glibc/musl) | `bin.linux26x86_64/p4` |
+| Linux ARM64 (glibc/musl) | `bin.linux26aarch64/p4` |
+
 ## License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
-## Embedded Perforce Binary
-
-This crate bundles the Perforce (Helix Core) command-line client (`p4`) binary for each supported platform.
-The `p4` binary is proprietary software owned by Perforce Software, Inc.
-Use of the bundled binary is subject to Perforce's
-[Master Terms & Conditions and P4 Supplemental Terms](https://www.perforce.com/legal).
+The Perforce (`p4`) binary is proprietary software owned by Perforce Software, Inc.
+Use is subject to Perforce's [Master Terms & Conditions](https://www.perforce.com/legal).
+This crate does **not** bundle the binary — it either uses a system-installed copy or
+downloads it directly from Perforce's official filehost.
