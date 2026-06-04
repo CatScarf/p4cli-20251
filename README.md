@@ -4,7 +4,7 @@ A simple Rust library for full-featured P4 (Perforce) CLI with zero pre-install,
 
 ```toml
 [dependencies]
-p4cli-20251 = "0.5.1"
+p4cli-20251 = "0.5.2"
 ```
 
 ## Synchronous API
@@ -48,7 +48,7 @@ fn main() -> std::io::Result<()> {
 
 ## Streaming API
 
-Iterate over lines as they arrive. The stream ends with `P4StreamEvent::Exit`.
+Iterate over raw byte chunks as they arrive. The stream ends with `P4StreamEvent::Exit`.
 
 ```rust
 use p4cli_20251::{P4Cli, P4StreamEvent};
@@ -56,10 +56,19 @@ use p4cli_20251::{P4Cli, P4StreamEvent};
 fn main() -> std::io::Result<()> {
     let p4: P4Cli = P4Cli::new()?;
 
-    for event in p4.stream(&["sync", "//depot/..."])? {
+    for event in p4.stream(&["info"])? {
         match event? {
-            P4StreamEvent::Stdout(line) => println!("{line}"),
-            P4StreamEvent::Stderr(line) => eprintln!("{line}"),
+            P4StreamEvent::Stdout(chunk) => {
+                // Decode as UTF-8 (or other encoding)
+                if let Some(text) = chunk.as_utf8() {
+                    print!("{text}");
+                }
+            }
+            P4StreamEvent::Stderr(chunk) => {
+                if let Some(text) = chunk.as_utf8() {
+                    eprint!("{text}");
+                }
+            }
             P4StreamEvent::Exit(code) => println!("exit {code}"),
         }
     }

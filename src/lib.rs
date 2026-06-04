@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -90,19 +90,37 @@ impl std::fmt::Debug for P4Output {
 
 /// A single event yielded by [`P4Stream`].
 pub enum P4StreamEvent {
-    /// A line from stdout (UTF-8).
-    Stdout(String),
-    /// A line from stderr (UTF-8).
-    Stderr(String),
+    /// A chunk of stdout bytes (may be partial line / binary).
+    Stdout(Vec<u8>),
+    /// A chunk of stderr bytes (may be partial line / binary).
+    Stderr(Vec<u8>),
     /// The process has exited with the given code.
     Exit(i32),
+}
+
+impl P4StreamEvent {
+    /// Try to decode this event's payload as UTF-8. Returns `None` for
+    /// [`Exit`](P4StreamEvent::Exit) or non-UTF-8 data.
+    pub fn as_utf8(&self) -> Option<&str> {
+        match self {
+            P4StreamEvent::Stdout(data) | P4StreamEvent::Stderr(data) => {
+                std::str::from_utf8(data).ok()
+            }
+            P4StreamEvent::Exit(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for P4StreamEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            P4StreamEvent::Stdout(line) => write!(f, "{line}"),
-            P4StreamEvent::Stderr(line) => write!(f, "{line}"),
+            P4StreamEvent::Stdout(data) | P4StreamEvent::Stderr(data) => {
+                if let Ok(text) = std::str::from_utf8(data) {
+                    write!(f, "{text}")
+                } else {
+                    write!(f, "<{} bytes>", data.len())
+                }
+            }
             P4StreamEvent::Exit(code) => write!(f, "(exit {code})"),
         }
     }
@@ -110,17 +128,19 @@ impl std::fmt::Display for P4StreamEvent {
 
 /// A streaming iterator over the output of a `p4` process.
 ///
-/// Stdout and stderr are read concurrently by two OS threads and merged
-/// into a single line-oriented stream. The process is automatically reaped
-/// when the stream is exhausted. Dropping the stream mid-way kills the
-/// process and cleans up all resources.
+/// Stdout and stderr are read concurrently by two OS threads as raw byte
+/// chunks (~64 KB each) and merged into a single stream. The process is
+/// automatically reaped when the stream is exhausted. Dropping the stream
+/// mid-way kills the process and cleans up all resources.
 ///
 /// The final item yielded is always [`P4StreamEvent::Exit`] with the exit
 /// code, unless the stream is dropped early.
 ///
-/// **Note**: Output is split by `\n` and decoded as UTF-8 (`String`).
-/// Binary output is not supported — use the blocking
-/// [`P4Command::run`](crate::P4Command::run) API for binary-safe reads.
+/// # Encoding
+///
+/// Raw chunks are yielded — the caller decides the encoding.
+/// Use [`P4StreamEvent::as_utf8`] for a quick UTF-8 check, or
+/// `String::from_utf8()` / `encoding_rs` for full control.
 pub struct P4Stream {
     rx: std::sync::mpsc::Receiver<std::io::Result<P4StreamEvent>>,
     child: Option<Child>,
@@ -462,11 +482,11 @@ impl<'a> P4Command<'a> {
             });
         }
 
-        let stdout = child
+        let mut stdout = child
             .stdout
             .take()
             .ok_or_else(|| std::io::Error::other("stdout was not captured"))?;
-        let stderr = child
+        let mut stderr = child
             .stderr
             .take()
             .ok_or_else(|| std::io::Error::other("stderr was not captured"))?;
@@ -474,38 +494,46 @@ impl<'a> P4Command<'a> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut handles = Vec::new();
 
-        // Stdout reader thread.
+        // Stdout reader thread (64 KB chunks).
         let tx_out = tx.clone();
         handles.push(thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(l) => {
-                        if tx_out.send(Ok(P4StreamEvent::Stdout(l))).is_err() {
-                            break;
-                        }
-                    }
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = match stdout.read(&mut buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => n,
                     Err(e) => {
                         let _ = tx_out.send(Err(e));
                         break;
                     }
+                };
+                if tx_out
+                    .send(Ok(P4StreamEvent::Stdout(buf[..n].to_vec())))
+                    .is_err()
+                {
+                    break;
                 }
             }
         }));
 
-        // Stderr reader thread.
+        // Stderr reader thread (64 KB chunks).
         let tx_err = tx.clone();
         handles.push(thread::spawn(move || {
-            for line in BufReader::new(stderr).lines() {
-                match line {
-                    Ok(l) => {
-                        if tx_err.send(Ok(P4StreamEvent::Stderr(l))).is_err() {
-                            break;
-                        }
-                    }
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = match stderr.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
                     Err(e) => {
                         let _ = tx_err.send(Err(e));
                         break;
                     }
+                };
+                if tx_err
+                    .send(Ok(P4StreamEvent::Stderr(buf[..n].to_vec())))
+                    .is_err()
+                {
+                    break;
                 }
             }
         }));
@@ -662,15 +690,17 @@ mod tests {
         let mut saw_stdout = false;
         let mut saw_exit = false;
         for event in p4.stream(&["--help"])? {
-            match event? {
-                P4StreamEvent::Stdout(line) => {
-                    if line.contains("Usage:") {
+            match &event? {
+                P4StreamEvent::Stdout(data) => {
+                    if let Ok(text) = std::str::from_utf8(data)
+                        && text.contains("Usage:")
+                    {
                         saw_stdout = true;
                     }
                 }
                 P4StreamEvent::Stderr(_) => {}
                 P4StreamEvent::Exit(code) => {
-                    assert_eq!(code, 0);
+                    assert_eq!(*code, 0);
                     saw_exit = true;
                 }
             }
@@ -686,15 +716,17 @@ mod tests {
         let mut saw_stderr = false;
         let mut saw_exit = false;
         for event in p4.stream(&["--nonexistent-flag"])? {
-            match event? {
+            match &event? {
                 P4StreamEvent::Stdout(_) => {}
-                P4StreamEvent::Stderr(line) => {
-                    if line.contains("Invalid option") || line.contains("error") {
+                P4StreamEvent::Stderr(data) => {
+                    if let Ok(text) = std::str::from_utf8(data)
+                        && (text.contains("Invalid option") || text.contains("error"))
+                    {
                         saw_stderr = true;
                     }
                 }
                 P4StreamEvent::Exit(code) => {
-                    assert_ne!(code, 0, "nonexistent flag should fail");
+                    assert_ne!(*code, 0, "nonexistent flag should fail");
                     saw_exit = true;
                 }
             }
