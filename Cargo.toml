@@ -1,6 +1,6 @@
 [package]
 name = "p4cli-20251"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "A simple Rust library for full-featured P4 (Perforce) CLI with zero pre-install, already battle-tested and mature in production environments, where all errors are propagated via Result without any unwrap."
 readme = "README.md"
@@ -9,8 +9,18 @@ license = "MIT"
 
 [dependencies]
 zstd = "0.13.3"
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 p4cli-20251-win-x64 = "0.1.0"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 p4cli-20251-mac-arm64 = "0.1.0"
+
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
 p4cli-20251-mac-x64 = "0.1.0"
-p4cli-20251-linux-arm64 = "0.1.0"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 p4cli-20251-linux-x64 = "0.1.0"
+
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+p4cli-20251-linux-arm64 = "0.1.0"
