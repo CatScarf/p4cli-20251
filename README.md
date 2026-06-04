@@ -1,6 +1,6 @@
 # P4CLI-20251
 
-A simple Rust library to interact with Perforce command-line tools.
+A simple Rust library for full-featured P4 CLI with zero pre-install, where all errors are propagated via `Result` without any `unwrap`.
 
 ## Usage
 
