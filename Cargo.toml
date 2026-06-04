@@ -1,8 +1,8 @@
 [package]
 name = "p4cli-20251"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "A simple Rust library to interact with Perforce command-line tools."
+description = "A simple Rust library for full-featured P4 CLI with zero pre-install, where all errors are propagated via Result without any unwrap."
 readme = "README.md"
 repository = "https://github.com/CatScarf/p4cli-20251"
 license = "MIT"
