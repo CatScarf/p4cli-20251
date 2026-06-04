@@ -1,4 +1,4 @@
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -82,6 +82,84 @@ impl std::fmt::Debug for P4Output {
             .field("stdout_len", &self.stdout.len())
             .field("stderr_len", &self.stderr.len())
             .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming API
+// ---------------------------------------------------------------------------
+
+/// A single event yielded by [`P4Stream`].
+pub enum P4StreamEvent {
+    /// A line from stdout (UTF-8).
+    Stdout(String),
+    /// A line from stderr (UTF-8).
+    Stderr(String),
+    /// The process has exited with the given code.
+    Exit(i32),
+}
+
+impl std::fmt::Display for P4StreamEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            P4StreamEvent::Stdout(line) => write!(f, "{line}"),
+            P4StreamEvent::Stderr(line) => write!(f, "{line}"),
+            P4StreamEvent::Exit(code) => write!(f, "(exit {code})"),
+        }
+    }
+}
+
+/// A streaming iterator over the output of a `p4` process.
+///
+/// Stdout and stderr are read concurrently by two OS threads and merged
+/// into a single line-oriented stream. The process is automatically reaped
+/// when the stream is exhausted. Dropping the stream mid-way kills the
+/// process and cleans up all resources.
+///
+/// The final item yielded is always [`P4StreamEvent::Exit`] with the exit
+/// code, unless the stream is dropped early.
+pub struct P4Stream {
+    rx: std::sync::mpsc::Receiver<std::io::Result<P4StreamEvent>>,
+    child: Option<Child>,
+    /// Killing the child closes the pipes, which unblocks the reader
+    /// threads and lets them exit naturally.
+    #[allow(dead_code)]
+    handles: Vec<thread::JoinHandle<()>>,
+    exhausted: bool,
+}
+
+impl Iterator for P4Stream {
+    type Item = std::io::Result<P4StreamEvent>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.exhausted {
+            return None;
+        }
+        match self.rx.recv() {
+            Ok(item) => Some(item),
+            Err(_) => {
+                // All senders (reader threads) have finished → reap child.
+                self.exhausted = true;
+                let code = self
+                    .child
+                    .take()
+                    .and_then(|mut c| c.wait().ok())
+                    .and_then(|s| s.code())
+                    .unwrap_or(-1);
+                Some(Ok(P4StreamEvent::Exit(code)))
+            }
+        }
+    }
+}
+
+impl Drop for P4Stream {
+    fn drop(&mut self) {
+        // Kill child if still owned (stream was dropped mid-way).
+        if let Some(ref mut child) = self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // The reader threads will now hit EOF and exit on their own.
     }
 }
 
@@ -399,6 +477,100 @@ impl<'a> P4Command<'a> {
             stderr: stderr_buf,
         })
     }
+
+    /// Run the command and return a streaming iterator over output lines.
+    ///
+    /// Stdout and stderr are read concurrently by two OS threads and merged
+    /// into a single stream. The final event is always
+    /// [`P4StreamEvent::Exit`] with the exit code (unless the stream is
+    /// dropped early).
+    ///
+    /// Unlike [`run`](Self::run), this method does **not** support
+    /// [`timeout`](Self::timeout) — the caller controls iteration and can
+    /// drop the stream to cancel.
+    pub fn stream(&mut self) -> std::io::Result<P4Stream> {
+        let mut cmd = Command::new(&self.cli.bin_path);
+        cmd.args(&self.args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if self.stdin_data.is_some() {
+            cmd.stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+        if let Some(ref cwd) = self.cwd {
+            cmd.current_dir(cwd);
+        }
+        for (k, v) in &self.envs {
+            cmd.env(k, v);
+        }
+
+        let mut child = cmd.spawn()?;
+
+        if let Some(data) = self.stdin_data.take()
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            thread::spawn(move || {
+                let _ = stdin.write_all(&data);
+            });
+        }
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("stdout was not captured"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("stderr was not captured"))?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut handles = Vec::new();
+
+        // Stdout reader thread.
+        let tx_out = tx.clone();
+        handles.push(thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(l) => {
+                        if tx_out.send(Ok(P4StreamEvent::Stdout(l))).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx_out.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        }));
+
+        // Stderr reader thread.
+        let tx_err = tx.clone();
+        handles.push(thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                match line {
+                    Ok(l) => {
+                        if tx_err.send(Ok(P4StreamEvent::Stderr(l))).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx_err.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        }));
+
+        Ok(P4Stream {
+            rx,
+            child: Some(child),
+            handles,
+            exhausted: false,
+        })
+    }
 }
 
 /// Block until `child` exits, optionally killing it after `timeout`.
@@ -446,6 +618,13 @@ impl P4Cli {
     /// This is equivalent to `self.command().args(args).run()`.
     pub fn run<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> std::io::Result<P4Output> {
         self.command().args(args).run()
+    }
+
+    /// Convenience method: stream p4 output with the given arguments.
+    ///
+    /// This is equivalent to `self.command().args(args).stream()`.
+    pub fn stream<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> std::io::Result<P4Stream> {
+        self.command().args(args).stream()
     }
 
     /// Obtain a [`P4Command`] builder for fine-grained control over
@@ -528,6 +707,77 @@ mod tests {
         // After kill the exit code is typically non-zero (e.g. -1 or a signal number).
         // We only verify the call does not hang.
         assert!(!output.success() || output.exit_code() == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_help() -> std::io::Result<()> {
+        let p4 = P4Cli::new()?;
+        let mut saw_stdout = false;
+        let mut saw_exit = false;
+        for event in p4.stream(&["--help"])? {
+            match event? {
+                P4StreamEvent::Stdout(line) => {
+                    if line.contains("Usage:") {
+                        saw_stdout = true;
+                    }
+                }
+                P4StreamEvent::Stderr(_) => {}
+                P4StreamEvent::Exit(code) => {
+                    assert_eq!(code, 0);
+                    saw_exit = true;
+                }
+            }
+        }
+        assert!(saw_stdout, "expected --help to contain 'Usage:'");
+        assert!(saw_exit, "expected Exit event");
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_error() -> std::io::Result<()> {
+        let p4 = P4Cli::new()?;
+        let mut saw_stderr = false;
+        let mut saw_exit = false;
+        for event in p4.stream(&["--nonexistent-flag"])? {
+            match event? {
+                P4StreamEvent::Stdout(_) => {}
+                P4StreamEvent::Stderr(line) => {
+                    if line.contains("Invalid option") || line.contains("error") {
+                        saw_stderr = true;
+                    }
+                }
+                P4StreamEvent::Exit(code) => {
+                    assert_ne!(code, 0, "nonexistent flag should fail");
+                    saw_exit = true;
+                }
+            }
+        }
+        assert!(saw_stderr, "expected error output");
+        assert!(saw_exit, "expected Exit event");
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_drop_midway() -> std::io::Result<()> {
+        // Dropping the stream mid-way must not hang or panic.
+        let p4 = P4Cli::new()?;
+        let stream = p4.stream(&["--help"])?;
+        drop(stream);
+        Ok(())
+    }
+
+    #[test]
+    fn test_stream_builder() -> std::io::Result<()> {
+        let p4 = P4Cli::new()?;
+        let mut saw_exit = false;
+        for event in p4.command().arg("--help").stream()? {
+            if let P4StreamEvent::Exit(code) = event? {
+                assert_eq!(code, 0);
+                saw_exit = true;
+            }
+        }
+        assert!(saw_exit);
         Ok(())
     }
 }
