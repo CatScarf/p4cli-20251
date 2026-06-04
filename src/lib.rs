@@ -12,7 +12,7 @@ use std::time::Duration;
 ///     let p4: P4Cli = P4Cli::new()?;
 ///     let output: p4cli_20251::P4Output = p4.run(&["--help"])?;
 ///     println!("exit: {}", output.exit_code());
-///     println!("{}", output.stdout_str()?);
+///     println!("stdout: {}", output.stdout_str()?);
 ///     Ok(())
 /// }
 /// ```
@@ -21,9 +21,13 @@ pub struct P4Cli {
     _temp_dir: tempfile::TempDir,
 }
 
-/// Raw stdout/stderr bytes and exit code from a p4 invocation.
+/// Raw stdout/stderr bytes, exit code and timeout flag from a p4 invocation.
+///
+/// For large outputs (e.g. `p4 sync`, `p4 fstat`), use [`P4Cli::stream`]
+/// instead of [`P4Cli::run`] to avoid buffering all output in memory.
 pub struct P4Output {
     exit_code: i32,
+    timed_out: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -33,8 +37,14 @@ impl P4Output {
         self.exit_code
     }
 
+    /// Returns `true` when the process was killed by a timeout.
+    pub fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+
+    /// Returns `true` when the process exited with code 0 and was not timed out.
     pub fn success(&self) -> bool {
-        self.exit_code == 0
+        !self.timed_out && self.exit_code == 0
     }
 
     pub fn stdout(&self) -> &[u8] {
@@ -76,6 +86,7 @@ impl std::fmt::Debug for P4Output {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("P4Output")
             .field("exit_code", &self.exit_code)
+            .field("timed_out", &self.timed_out)
             .field("stdout_len", &self.stdout.len())
             .field("stderr_len", &self.stderr.len())
             .finish()
@@ -122,7 +133,8 @@ impl std::fmt::Display for P4StreamEvent {
 
 /// Merged stdout/stderr byte chunks (~64 KB each) as a single iterator.
 ///
-/// The final item is always [`P4StreamEvent::Exit`]. Drop mid-way to kill.
+/// Uses a bounded channel (64 slots) for backpressure. The final item is
+/// always [`P4StreamEvent::Exit`]. Drop mid-way to kill.
 ///
 /// ```rust
 /// use p4cli_20251::{P4Cli, P4StreamEvent};
@@ -149,9 +161,15 @@ impl std::fmt::Display for P4StreamEvent {
 pub struct P4Stream {
     rx: std::sync::mpsc::Receiver<std::io::Result<P4StreamEvent>>,
     child: Option<Child>,
-    #[allow(dead_code)]
-    handles: Vec<thread::JoinHandle<()>>,
     exhausted: bool,
+}
+
+impl std::fmt::Debug for P4Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("P4Stream")
+            .field("exhausted", &self.exhausted)
+            .finish()
+    }
 }
 
 impl Iterator for P4Stream {
@@ -165,13 +183,14 @@ impl Iterator for P4Stream {
             Ok(item) => Some(item),
             Err(_) => {
                 self.exhausted = true;
-                let code = self
-                    .child
-                    .take()
-                    .and_then(|mut c| c.wait().ok())
-                    .and_then(|s| s.code())
-                    .unwrap_or(-1);
-                Some(Ok(P4StreamEvent::Exit(code)))
+                // Wait for the child to be reaped.
+                match self.child.take() {
+                    Some(mut c) => match c.wait() {
+                        Ok(status) => Some(Ok(P4StreamEvent::Exit(status.code().unwrap_or(-1)))),
+                        Err(e) => Some(Err(e)),
+                    },
+                    None => None,
+                }
             }
         }
     }
@@ -179,6 +198,10 @@ impl Iterator for P4Stream {
 
 impl Drop for P4Stream {
     fn drop(&mut self) {
+        // Drop rx so sender threads break out of send().
+        // The handles field is consumed by join, but dropping JoinHandle
+        // simply detaches the thread — the threads exit on their own once
+        // the child is killed and pipes close.
         if let Some(ref mut child) = self.child {
             let _ = child.kill();
             let _ = child.wait();
@@ -257,13 +280,21 @@ fn get_p4_cli_zst() -> Vec<u8> {
         get_p4_cli_zst()
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        any(target_env = "gnu", target_env = "musl")
+    ))]
     {
         use p4cli_20251_linux_x64::get_p4_cli_zst;
         get_p4_cli_zst()
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        any(target_env = "gnu", target_env = "musl")
+    ))]
     {
         use p4cli_20251_linux_arm64::get_p4_cli_zst;
         get_p4_cli_zst()
@@ -273,8 +304,16 @@ fn get_p4_cli_zst() -> Vec<u8> {
         all(target_os = "windows", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64")
+        all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            any(target_env = "gnu", target_env = "musl")
+        ),
+        all(
+            target_os = "linux",
+            target_arch = "aarch64",
+            any(target_env = "gnu", target_env = "musl")
+        ),
     )))]
     {
         compile_error!(format!(
@@ -324,6 +363,9 @@ impl<'a> P4Command<'a> {
     }
 
     /// Maximum wall-clock time. Kills the direct child on timeout (not process tree).
+    ///
+    /// When the process is killed by timeout, [`P4Output::timed_out`] returns `true`.
+    /// Not supported with [`stream()`](Self::stream) — use [`run()`](Self::run) instead.
     pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
         self.timeout = Some(timeout);
         self
@@ -349,6 +391,9 @@ impl<'a> P4Command<'a> {
     }
 
     /// Block until the process exits, returning collected output.
+    ///
+    /// For large output, consider [`stream()`](Self::stream) instead to
+    /// avoid buffering everything in memory.
     pub fn run(&mut self) -> std::io::Result<P4Output> {
         let mut cmd = Command::new(&self.cli.bin_path);
         cmd.args(&self.args)
@@ -370,13 +415,17 @@ impl<'a> P4Command<'a> {
 
         let mut child = cmd.spawn()?;
 
-        if let Some(data) = self.stdin_data.take()
-            && let Some(mut stdin) = child.stdin.take()
-        {
-            thread::spawn(move || {
-                let _ = stdin.write_all(&data);
-            });
-        }
+        let stdin_handle = self.stdin_data.take().and_then(|data| {
+            child.stdin.take().map(|mut stdin| {
+                thread::spawn(move || {
+                    if let Err(e) = stdin.write_all(&data) {
+                        Err(e)
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+        });
 
         let stdout = child
             .stdout
@@ -399,7 +448,15 @@ impl<'a> P4Command<'a> {
             Ok::<_, std::io::Error>(buf)
         });
 
-        let exit_status = wait_process(&mut child, self.timeout)?;
+        let (exit_status, timed_out) = wait_process(&mut child, self.timeout)?;
+
+        // Surface stdin write errors.
+        if let Some(handle) = stdin_handle {
+            handle
+                .join()
+                .map_err(|_| std::io::Error::other("stdin thread panicked"))?
+                .map_err(|e| std::io::Error::other(format!("stdin write failed: {e}")))?;
+        }
 
         let stdout_buf = stdout_handle
             .join()
@@ -412,6 +469,7 @@ impl<'a> P4Command<'a> {
 
         Ok(P4Output {
             exit_code: exit_status.code().unwrap_or(-1),
+            timed_out,
             stdout: stdout_buf,
             stderr: stderr_buf,
         })
@@ -419,8 +477,18 @@ impl<'a> P4Command<'a> {
 
     /// Streaming iterator over stdout/stderr byte chunks.
     ///
-    /// The final event is [`P4StreamEvent::Exit`]. Drop mid-way to cancel.
+    /// Uses a bounded channel (64 slots) for backpressure. The final event
+    /// is [`P4StreamEvent::Exit`]. Drop mid-way to cancel.
+    ///
+    /// **Note**: [`timeout`](Self::timeout) is not supported — use
+    /// [`run()`](Self::run) instead.
     pub fn stream(&mut self) -> std::io::Result<P4Stream> {
+        if self.timeout.is_some() {
+            return Err(std::io::Error::other(
+                "timeout is not supported on stream(); use run() instead",
+            ));
+        }
+
         let mut cmd = Command::new(&self.cli.bin_path);
         cmd.args(&self.args)
             .stdout(Stdio::piped())
@@ -457,11 +525,11 @@ impl<'a> P4Command<'a> {
             .take()
             .ok_or_else(|| std::io::Error::other("stderr was not captured"))?;
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut handles = Vec::new();
+        // Bounded channel for backpressure (64 slots).
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
 
         let tx_out = tx.clone();
-        handles.push(thread::spawn(move || {
+        thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
             loop {
                 let n = match stdout.read(&mut buf) {
@@ -479,10 +547,10 @@ impl<'a> P4Command<'a> {
                     break;
                 }
             }
-        }));
+        });
 
         let tx_err = tx.clone();
-        handles.push(thread::spawn(move || {
+        thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
             loop {
                 let n = match stderr.read(&mut buf) {
@@ -500,12 +568,11 @@ impl<'a> P4Command<'a> {
                     break;
                 }
             }
-        }));
+        });
 
         Ok(P4Stream {
             rx,
             child: Some(child),
-            handles,
             exhausted: false,
         })
     }
@@ -515,22 +582,25 @@ impl<'a> P4Command<'a> {
 // Process helpers
 // ---------------------------------------------------------------------------
 
-fn wait_process(child: &mut Child, timeout: Option<Duration>) -> std::io::Result<ExitStatus> {
+fn wait_process(
+    child: &mut Child,
+    timeout: Option<Duration>,
+) -> std::io::Result<(ExitStatus, bool)> {
     match timeout {
-        None => child.wait(),
+        None => Ok((child.wait()?, false)),
         Some(t) => wait_with_timeout(child, t),
     }
 }
 
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> std::io::Result<ExitStatus> {
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> std::io::Result<(ExitStatus, bool)> {
     let start = std::time::Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(status);
+            return Ok((status, false));
         }
         if start.elapsed() >= timeout {
             child.kill()?;
-            return child.wait();
+            return Ok((child.wait()?, true));
         }
         thread::sleep(Duration::from_millis(50));
     }

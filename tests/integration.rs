@@ -19,6 +19,7 @@ fn test_run_error() -> std::io::Result<()> {
     let p4 = P4Cli::new()?;
     let output = p4.run(&["--nonexistent-flag"])?;
     assert!(!output.success(), "unknown flag should exit non-zero");
+    assert!(!output.timed_out(), "should not be timed out");
     let stderr = output.stderr_str()?;
     assert!(
         stderr.contains("Invalid option") || stderr.contains("error"),
@@ -45,14 +46,34 @@ fn test_command_builder() -> std::io::Result<()> {
 }
 
 #[test]
-fn test_timeout_kills() -> std::io::Result<()> {
+fn test_timeout_detected() -> std::io::Result<()> {
     let p4 = P4Cli::new()?;
     let output = p4
         .command()
         .arg("help")
         .timeout(Duration::from_millis(1))
         .run()?;
-    assert!(!output.success() || output.exit_code() == 0);
+    // The process should be timed out, not exit normally.
+    assert!(
+        output.timed_out(),
+        "expected timed_out=true for short timeout"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_stream_rejects_timeout() -> std::io::Result<()> {
+    let p4 = P4Cli::new()?;
+    let err = p4
+        .command()
+        .arg("--help")
+        .timeout(Duration::from_secs(1))
+        .stream()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("timeout"),
+        "expected timeout error, got: {err}"
+    );
     Ok(())
 }
 
