@@ -4,7 +4,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::Duration;
 
-/// Per-instance temp dir, cleaned up on Drop.
+/// Per-instance temp dir via `tempfile`, cleaned up on Drop.
 ///
 /// ```rust
 /// use p4cli_20251::P4Cli;
@@ -18,7 +18,7 @@ use std::time::Duration;
 /// ```
 pub struct P4Cli {
     bin_path: PathBuf,
-    _temp_dir: PathBuf,
+    _temp_dir: tempfile::TempDir,
 }
 
 /// Raw stdout/stderr bytes and exit code from a p4 invocation.
@@ -190,25 +190,13 @@ impl Drop for P4Stream {
 // Binary extraction
 // ---------------------------------------------------------------------------
 
-fn write_p4_cli_to_disk() -> std::io::Result<(PathBuf, PathBuf)> {
+fn write_p4_cli_to_disk() -> std::io::Result<(PathBuf, tempfile::TempDir)> {
     let zst_data = get_p4_cli_zst();
     let binary_data = decompress_zst(&zst_data)?;
 
-    let base = std::env::temp_dir().join("p4cli-20251");
-    std::fs::create_dir_all(&base)?;
-
-    let dir = base.join(format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir(&dir)?;
-
-    let bin_path = dir.join("p4_binary");
-    let tmp_path = dir.join(".tmp");
+    let temp_dir = create_temp_dir()?;
+    let bin_path = temp_dir.path().join("p4_binary");
+    let tmp_path = temp_dir.path().join(".tmp");
 
     {
         let mut file = std::fs::File::create(&tmp_path)?;
@@ -218,7 +206,18 @@ fn write_p4_cli_to_disk() -> std::io::Result<(PathBuf, PathBuf)> {
     std::fs::rename(&tmp_path, &bin_path)?;
     set_executable_perms(&bin_path)?;
 
-    Ok((bin_path, dir))
+    Ok((bin_path, temp_dir))
+}
+
+fn create_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("p4cli-20251");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
 }
 
 fn decompress_zst(zst_data: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -542,7 +541,7 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> std::io::Result<Ex
 // ---------------------------------------------------------------------------
 
 impl P4Cli {
-    /// Decompress embedded p4 binary to a fresh temp directory.
+    /// Decompress embedded p4 binary to a `tempfile`-managed temp directory.
     pub fn new() -> std::io::Result<Self> {
         let (bin_path, temp_dir) = write_p4_cli_to_disk()?;
         Ok(Self {
@@ -581,11 +580,5 @@ impl P4Cli {
     /// ```
     pub fn command(&self) -> P4Command<'_> {
         P4Command::new(self)
-    }
-}
-
-impl Drop for P4Cli {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self._temp_dir);
     }
 }
