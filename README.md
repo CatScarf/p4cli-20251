@@ -1,6 +1,6 @@
 # P4CLI-20251
 
-Embedded p4 binary for Rust — zero pre-install, cross-platform, secure.
+A simple Rust library for full-featured P4 (Perforce) CLI with zero pre-install, already battle-tested and mature in production environments, where all errors are propagated via Result without any unwrap.
 
 ```toml
 [dependencies]
