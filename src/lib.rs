@@ -7,8 +7,7 @@ use std::time::Duration;
 /// A P4 CLI wrapper that extracts the embedded p4 binary to an isolated temporary directory.
 ///
 /// Each `P4Cli` instance gets its own temp directory, eliminating cross-process races.
-/// A content-addressed cache avoids repeated zstd decompression across instances.
-/// Stale temp directories (older than 1 hour) are cleaned up on construction.
+/// The temp directory is cleaned up on `Drop`.
 pub struct P4Cli {
     bin_path: PathBuf,
     _temp_dir: PathBuf,
@@ -118,6 +117,10 @@ impl std::fmt::Display for P4StreamEvent {
 ///
 /// The final item yielded is always [`P4StreamEvent::Exit`] with the exit
 /// code, unless the stream is dropped early.
+///
+/// **Note**: Output is split by `\n` and decoded as UTF-8 (`String`).
+/// Binary output is not supported — use the blocking
+/// [`P4Command::run`](crate::P4Command::run) API for binary-safe reads.
 pub struct P4Stream {
     rx: std::sync::mpsc::Receiver<std::io::Result<P4StreamEvent>>,
     child: Option<Child>,
@@ -164,85 +167,18 @@ impl Drop for P4Stream {
 }
 
 // ---------------------------------------------------------------------------
-// Cache & temporary-directory helpers
+// Temporary-directory helpers
 // ---------------------------------------------------------------------------
 
-/// The base directory under `TMP` / `/tmp` where everything lives.
-fn base_dir() -> PathBuf {
-    std::env::temp_dir().join("p4cli-20251")
-}
-
-/// A simple content fingerprint for the embedded zstd payload.
-///
-/// Uses `(length, first 64 bytes)` – sufficient for cache invalidation
-/// since the payload is embedded at compile time and never tampered with.
-fn fingerprint(data: &[u8]) -> String {
-    let n = data.len();
-    let prefix = &data[..data.len().min(64)];
-    let hex: String = prefix.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("{}_{}", n, hex)
-}
-
-/// Remove instance directories whose modification time is older than `cutoff`.
-///
-/// The `.cache` directory is never removed here – it is managed separately.
-fn cleanup_stale_dirs(base: &PathBuf, cutoff: std::time::SystemTime) {
-    let Ok(entries) = std::fs::read_dir(base) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        // Skip the cache directory.
-        if path.file_name().is_some_and(|n| n == ".cache") {
-            continue;
-        }
-        if let Ok(meta) = path.metadata()
-            && let Ok(mtime) = meta.modified()
-            && mtime < cutoff
-        {
-            let _ = std::fs::remove_dir_all(&path);
-        }
-    }
-}
-
-/// Ensure the p4 binary exists on disk inside a fresh per-instance directory.
-///
-/// Caching
-/// -------
-/// The decompressed binary is cached at `base/.cache/{fingerprint}/p4_binary`.
-/// Only the very first `P4Cli` on a given build host pays the decompression
-/// cost; all subsequent instances copy (not decompress) from the cache.
+/// Decompress the embedded zstd payload and write it to a fresh per-instance
+/// directory. No persistent cache — each instance gets its own isolated copy.
 fn write_p4_cli_to_disk() -> std::io::Result<(PathBuf, PathBuf)> {
     let zst_data = get_p4_cli_zst();
-    let fp = fingerprint(&zst_data);
+    let binary_data = decompress_zst(&zst_data)?;
 
-    let base = base_dir();
+    let base = std::env::temp_dir().join("p4cli-20251");
     std::fs::create_dir_all(&base)?;
 
-    // Clean up stale instance directories (older than 1 hour).
-    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    cleanup_stale_dirs(&base, cutoff);
-
-    // Ensure the cache entry exists (race-safe: unique tmp name per PID).
-    let cache_dir = base.join(".cache").join(&fp);
-    let cache_bin = cache_dir.join("p4_binary");
-    if !cache_bin.exists() {
-        std::fs::create_dir_all(&cache_dir)?;
-        let binary_data = decompress_zst(&zst_data)?;
-        let tmp = cache_dir.join(format!(".tmp.{}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&binary_data)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &cache_bin)?;
-        set_executable_perms(&cache_bin)?;
-    }
-
-    // Per-instance directory.
     let dir = base.join(format!(
         "{}_{}",
         std::process::id(),
@@ -252,10 +188,17 @@ fn write_p4_cli_to_disk() -> std::io::Result<(PathBuf, PathBuf)> {
             .unwrap_or(0)
     ));
     std::fs::create_dir(&dir)?;
-    let bin_path = dir.join("p4_binary");
 
-    // Copy (not hardlink – avoids cross-device link errors on some setups).
-    std::fs::copy(&cache_bin, &bin_path)?;
+    let bin_path = dir.join("p4_binary");
+    let tmp_path = dir.join(".tmp");
+
+    // Atomic write: write to .tmp first, then rename.
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(&binary_data)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &bin_path)?;
     set_executable_perms(&bin_path)?;
 
     Ok((bin_path, dir))
@@ -375,6 +318,9 @@ impl<'a> P4Command<'a> {
 
     /// Maximum wall-clock time the process is allowed to run.
     /// When exceeded the process is killed.
+    ///
+    /// **Note**: Only the direct child process is terminated,
+    /// not its descendants (no process-tree kill).
     pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
         self.timeout = Some(timeout);
         self
@@ -602,9 +548,9 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> std::io::Result<Ex
 impl P4Cli {
     /// Create a new `P4Cli` instance.
     ///
-    /// The embedded p4 binary is decompressed once and cached on disk.
-    /// Subsequent instances on the same host reuse the cache.
-    /// Stale per-instance directories (older than 1 hour) are cleaned up.
+    /// The embedded p4 binary is decompressed and written to an isolated
+    /// temporary directory. Each call performs a fresh decompression;
+    /// there is no persistent cache (see security notes in the crate docs).
     pub fn new() -> std::io::Result<Self> {
         let (bin_path, temp_dir) = write_p4_cli_to_disk()?;
         Ok(Self {
