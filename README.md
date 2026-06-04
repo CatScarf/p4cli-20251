@@ -1,12 +1,12 @@
 # P4CLI-20251
 
-A simple Rust library for full-featured P4 CLI with zero pre-install, where all errors are propagated via `Result` without any `unwrap`.
+A simple Rust library for full-featured P4 (Perforce) CLI with zero pre-install, already battle-tested and mature in production environments, where all errors are propagated via `Result` without any `unwrap`.
 
 ## Usage
 
 ```toml
 [dependencies]
-p4cli-20251 = "0.3.0"
+p4cli-20251 = "0.4.0"
 ```
 
 ```rust
