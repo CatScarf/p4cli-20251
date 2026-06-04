@@ -8,6 +8,21 @@ use std::time::Duration;
 ///
 /// Each `P4Cli` instance gets its own temp directory, eliminating cross-process races.
 /// The temp directory is cleaned up on `Drop`.
+///
+/// # Example
+///
+/// ```rust
+/// use p4cli_20251::P4Cli;
+///
+/// fn main() -> std::io::Result<()> {
+///     let p4: P4Cli = P4Cli::new()?;
+///     let output: p4cli_20251::P4Output = p4.run(&["--help"])?;
+///
+///     println!("exit: {}", output.exit_code());
+///     println!("{}", output.stdout_str()?);
+///     Ok(())
+/// }
+/// ```
 pub struct P4Cli {
     bin_path: PathBuf,
     _temp_dir: PathBuf,
@@ -44,17 +59,17 @@ impl P4Output {
     }
 
     /// Decode stdout as UTF-8.
-    pub fn stdout_str(&self) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(&self.stdout)
+    pub fn stdout_str(&self) -> std::io::Result<&str> {
+        std::str::from_utf8(&self.stdout).map_err(std::io::Error::other)
     }
 
     /// Decode stderr as UTF-8.
-    pub fn stderr_str(&self) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(&self.stderr)
+    pub fn stderr_str(&self) -> std::io::Result<&str> {
+        std::str::from_utf8(&self.stderr).map_err(std::io::Error::other)
     }
 
     /// Lines of stdout (UTF-8 text only).
-    pub fn stdout_lines(&self) -> Result<Vec<&str>, std::str::Utf8Error> {
+    pub fn stdout_lines(&self) -> std::io::Result<Vec<&str>> {
         let s = self.stdout_str()?;
         if s.is_empty() {
             Ok(Vec::new())
@@ -64,7 +79,7 @@ impl P4Output {
     }
 
     /// Lines of stderr (UTF-8 text only).
-    pub fn stderr_lines(&self) -> Result<Vec<&str>, std::str::Utf8Error> {
+    pub fn stderr_lines(&self) -> std::io::Result<Vec<&str>> {
         let s = self.stderr_str()?;
         if s.is_empty() {
             Ok(Vec::new())
@@ -141,6 +156,32 @@ impl std::fmt::Display for P4StreamEvent {
 /// Raw chunks are yielded — the caller decides the encoding.
 /// Use [`P4StreamEvent::as_utf8`] for a quick UTF-8 check, or
 /// `String::from_utf8()` / `encoding_rs` for full control.
+///
+/// # Example
+///
+/// ```rust
+/// use p4cli_20251::{P4Cli, P4StreamEvent};
+///
+/// fn main() -> std::io::Result<()> {
+///     let p4: P4Cli = P4Cli::new()?;
+///     for event in p4.stream(&["--help"])? {
+///         match event? {
+///             P4StreamEvent::Stdout(chunk) => {
+///                 if let Ok(text) = std::str::from_utf8(&chunk) {
+///                     print!("{text}");
+///                 }
+///             }
+///             P4StreamEvent::Stderr(chunk) => {
+///                 if let Ok(text) = std::str::from_utf8(&chunk) {
+///                     eprint!("{text}");
+///                 }
+///             }
+///             P4StreamEvent::Exit(code) => println!("exit {code}"),
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
 pub struct P4Stream {
     rx: std::sync::mpsc::Receiver<std::io::Result<P4StreamEvent>>,
     child: Option<Child>,
@@ -603,6 +644,27 @@ impl P4Cli {
 
     /// Obtain a [`P4Command`] builder for fine-grained control over
     /// working directory, environment variables, stdin, and timeout.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use p4cli_20251::P4Cli;
+    /// use std::time::Duration;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let p4: P4Cli = P4Cli::new()?;
+    ///     let output: p4cli_20251::P4Output = p4
+    ///         .command()
+    ///         .arg("--help")
+    ///         .timeout(Duration::from_secs(10))
+    ///         .run()?;
+    ///
+    ///     if output.success() {
+    ///         println!("{}", output.stdout_str()?);
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn command(&self) -> P4Command<'_> {
         P4Command::new(self)
     }
@@ -627,9 +689,7 @@ mod tests {
         let p4 = P4Cli::new()?;
         let output = p4.run(&["--help"])?;
         assert!(output.success(), "p4 --help should exit with 0");
-        let stdout = output
-            .stdout_str()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let stdout = output.stdout_str()?;
         assert!(
             stdout.contains("Usage:"),
             "expected --help output to contain 'Usage:'"
@@ -642,9 +702,7 @@ mod tests {
         let p4 = P4Cli::new()?;
         let output = p4.run(&["--nonexistent-flag"])?;
         assert!(!output.success(), "unknown flag should exit non-zero");
-        let stderr = output
-            .stderr_str()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let stderr = output.stderr_str()?;
         assert!(
             stderr.contains("Invalid option") || stderr.contains("error"),
             "expected error output, got: {stderr}"

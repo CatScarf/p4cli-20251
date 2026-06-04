@@ -60,12 +60,12 @@ fn main() -> std::io::Result<()> {
         match event? {
             P4StreamEvent::Stdout(chunk) => {
                 // Decode as UTF-8 (or other encoding)
-                if let Some(text) = chunk.as_utf8() {
+                if let Ok(text) = std::str::from_utf8(&chunk) {
                     print!("{text}");
                 }
             }
             P4StreamEvent::Stderr(chunk) => {
-                if let Some(text) = chunk.as_utf8() {
+                if let Ok(text) = std::str::from_utf8(&chunk) {
                     eprint!("{text}");
                 }
             }
