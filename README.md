@@ -87,7 +87,7 @@ Drop the stream mid-way to cancel the process.
 | Target | Download |
 |--------|----------|
 | Windows x86\_64 | `bin.ntx64/p4.exe` |
-| macOS ARM64 | `bin.mac20arm64/p4` |
+| macOS ARM64 | `bin.macosx12arm64/p4` |
 | macOS x86\_64 | `bin.macosx1015x86_64/p4` |
 | Linux x86\_64 (glibc/musl) | `bin.linux26x86_64/p4` |
 | Linux ARM64 (glibc/musl) | `bin.linux26aarch64/p4` |

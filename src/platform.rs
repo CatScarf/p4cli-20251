@@ -14,7 +14,7 @@ fn platform_path() -> Option<&'static str> {
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        Some("bin.mac20arm64/p4")
+        Some("bin.macosx12arm64/p4")
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
