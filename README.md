@@ -6,7 +6,7 @@ The `p4` binary is **not** bundled. On first use, it locates a system installati
 
 ```toml
 [dependencies]
-p4cli-20251 = "0.6.0"
+p4cli-20251 = "0.6.1"
 ```
 
 ## Synchronous API
