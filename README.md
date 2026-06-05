@@ -1,8 +1,6 @@
 # P4CLI-20251
 
-A simple Rust library for full-featured P4 (Perforce) CLI with zero pre-install. All errors are propagated via `Result` without any `unwrap`.
-
-The `p4` binary is **not** bundled. On first use, it locates a system installation or downloads it from Perforce's official filehost.
+A simple Rust library for full-featured P4 (Perforce) CLI without bundling the binary — auto-detects system p4 or downloads from Perforce's official filehost. All errors are propagated via `Result` without any `unwrap`.
 
 ```toml
 [dependencies]
