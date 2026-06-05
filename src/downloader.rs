@@ -83,7 +83,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires network access to Perforce filehost"]
     fn test_download_p4_from_perforce() {
         let url = platform::download_url().expect("unsupported platform");
         let tmp = tempfile::TempDir::new().unwrap();
