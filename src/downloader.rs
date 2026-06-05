@@ -77,7 +77,24 @@ mod tests {
     fn test_download_bogus_url_fails_gracefully() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dest = tmp.path().join("p4");
-        let result = download_to("https://filehost.perforce.com/perforce/nonexistent", &dest);
+        // Use a non-routable IP to avoid relying on external servers.
+        let result = download_to("http://10.255.255.1/nonexistent", &dest);
         assert!(result.is_err(), "bogus URL should fail");
+    }
+
+    #[test]
+    #[ignore = "requires network access to Perforce filehost"]
+    fn test_download_p4_from_perforce() {
+        let url = platform::download_url().expect("unsupported platform");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join(platform::binary_name());
+
+        let result = download_to(&url, &dest);
+        assert!(result.is_ok(), "download from {url} failed: {result:?}");
+        assert!(dest.exists(), "downloaded file should exist");
+        assert!(
+            dest.metadata().unwrap().len() > 1000,
+            "downloaded file too small"
+        );
     }
 }
